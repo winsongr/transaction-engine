@@ -1,269 +1,276 @@
 # Transaction Engine
 
-**Part 2 of the Sentinel System - Deterministic Workflow & State Integrity**
+Transactional workflow engine designed to prevent state corruption in payment and finance systems.
 
-This repository implements a transactional workflow engine focused on state correctness under concurrency.
+Built to enforce exactly-once state transitions under concurrency.
 
-It is intentionally narrow in scope and optimized for **correctness, auditability, and determinism**, not feature breadth.
-
-This service complements the ingestion pipeline handled by the companion service:
-**[async-rag-ingestion-engine](https://github.com/winsongr/async-rag-ingestion-engine)**
+Companion system: [async-rag-ingestion-engine](https://github.com/winsongr/async-rag-ingestion-engine)
 
 ---
 
-## ⚡ Why This Exists
+## Why This Exists
 
-Backend systems fail for different reasons:
+Payment systems fail when state becomes ambiguous. This engine eliminates that failure mode.
 
-- **Ingestion systems** fail due to bad, partial, or duplicated data.
-- **Transaction systems** fail due to corrupted or ambiguous state.
+**Guarantees:**
+- States are FSM-validated (no arbitrary transitions)
+- State changes are exactly-once (optimistic locking)
+- Events are reliably published (transactional outbox)
+- History is immutable (append-only audit log)
 
-This service addresses the second problem.
-
-Once a workflow step is committed here, its state is guaranteed to be:
-
-- **Valid** (FSM enforced)
-- **Auditable** (Append-only history)
-- **Replay-safe** (Idempotent)
-- **Externally observable** (via Kafka)
-
-This system is built for **correctness over convenience**.
+Built for correctness over convenience.
 
 ---
 
-## 🎯 Core Responsibility
+## Core Responsibility
 
-This service guarantees:
+**Handles:**
+- Strict state transitions via Finite State Machine
+- Exactly-once state changes (DB transaction + version check)
+- Reliable Kafka publishing (transactional outbox pattern)
+- Full audit trail (immutable records)
 
-- **Strict state transitions** enforced by a Finite State Machine (FSM).
-- **Exactly-once state changes** via database transactions and optimistic locking.
-- **Reliable event emission** using the Transactional Outbox pattern.
-- **Full auditability** through immutable records.
+**Does NOT handle:**
+- Document ingestion (different failure mode)
+- Vector storage (wrong bounded context)
+- Retry-heavy pipelines (isolated to ingestion layer)
 
-It explicitly **does not** handle:
-
-- Document ingestion
-- Embeddings or vector storage
-- AI inference
-- Retry-heavy pipelines
-
-Those concerns have different failure modes and are isolated by design.
+Separation prevents failure modes from bleeding across systems.
 
 ---
 
-## 🏗 Architecture
-
-Workflows are modeled as state machines, not mutable status flags.
-
-- Input validation occurs at the API boundary.
-- Business correctness is enforced in the domain layer.
-
+## Architecture
 ```mermaid
-flowchart LR
-    Client --> API
-    API --> Service["Service Layer"]
-    Service --> Domain["Domain (FSM)"]
-    Service --> UoW["Unit of Work"]
-    UoW --> DB["PostgreSQL"]
-    UoW --> Outbox
+sequenceDiagram
+    participant Client
+    participant API
+    participant Service
+    participant DB as PostgreSQL
+    participant Outbox
+    participant Publisher
+    participant Kafka
 
-    subgraph "Atomic Transaction"
-        DB
-        Outbox
-    end
+    Client->>API: POST /transactions/{id}/transition
+    API->>Service: Validate + Apply FSM
+    Service->>DB: BEGIN TRANSACTION
+    Service->>DB: UPDATE state (version check)
+    Service->>Outbox: INSERT event
+    Service->>DB: COMMIT
+    DB-->>API: Success
+    API-->>Client: 200 OK
 
-    Publisher["Outbox Publisher"] --> Outbox
-    Publisher --> Kafka
-    Kafka --> Consumers["Downstream Systems"]
+    Note over DB,Outbox: Atomic Write
+
+    Publisher->>Outbox: Poll unpublished events
+    Publisher->>Kafka: Publish event
+    Publisher->>Outbox: Mark published
 ```
 
-**Key Invariant:**
-State change and outbox write occur in **one atomic database transaction**.
-PostgreSQL is the system of record. Kafka is used strictly for integration.
+**Key invariant:** State change and outbox write happen in one atomic transaction.
 
 ---
 
-## 🧠 Design Decisions
+## Design Decisions
 
 ### 1. Finite State Machine (FSM)
 
 States cannot be set arbitrarily. Each transition is explicitly allowed or rejected.
+```python
+ALLOWED_TRANSITIONS = {
+    "CREATED": ["PENDING"],
+    "PENDING": ["COMPLETED", "FAILED"],
+    "COMPLETED": [],  # Terminal state
+    "FAILED": ["PENDING"],  # Allow retry
+}
+```
 
+**Examples:**
 - `CREATED → PENDING` ✅
-- `PENDING → COMPLETED` ✅
-- `FAILED → COMPLETED` ❌ (Illegal)
+- `PENDING → COMPLETED` ✅  
+- `FAILED → COMPLETED` ❌ (Illegal - fails loudly)
 
-Invalid transitions fail fast and loudly, preventing silent corruption.
+Invalid transitions fail fast, preventing silent corruption.
+
+---
 
 ### 2. Transactional Outbox Pattern
 
-Publishing directly to Kafka inside request handlers is unsafe (the "Dual-Write Problem").
+Publishing directly to Kafka from request handlers is unsafe (dual-write problem: DB succeeds, Kafka fails → inconsistency).
 
-**Our Solution:**
+**Our approach:**
+1. Begin DB transaction
+2. Apply state change
+3. Insert event to `outbox` table
+4. Commit transaction
+5. Background worker publishes to Kafka
 
-1. Begin database transaction.
-2. Apply state change.
-3. Insert event into `outbox` table.
-4. Commit transaction.
-5. Background worker publishes events to Kafka.
+**Result:** No lost events, no phantom events. DB and Kafka stay consistent.
 
-**Result:** No lost events. No phantom events. Database and Kafka remain consistent.
+---
 
 ### 3. Optimistic Locking
 
-Concurrent updates are controlled using version checks at the database level.
-If two requests attempt to mutate the same transaction concurrently:
+Concurrent updates use version checks:
+```sql
+UPDATE transactions 
+SET state = 'COMPLETED', version = version + 1
+WHERE id = '...' AND version = 5
+```
 
-- One succeeds.
-- One is rejected (409 Conflict).
+**Under contention:**
+- First request succeeds (version match)
+- Second request fails (version mismatch → 409 Conflict)
 
-This enforces **single-winner semantics** under contention.
+Enforces single-winner semantics without heavyweight locks.
+
+---
 
 ### 4. Idempotency
 
-All externally triggered operations require an `X-Idempotency-Key` header.
-If the same request is retried:
+All state-changing operations require `X-Idempotency-Key` header.
 
-- State is not duplicated.
-- Events are not re-emitted.
-- No double-settlement occurs.
+**On retry:**
+- Same key → same outcome (no duplicate state change)
+- Same key → same event (no duplicate Kafka message)
+- Safe to retry unconditionally
 
-Retries are safe by construction.
-
-### 5. Append-Only Audit Model
-
-State-changing records are immutable:
-
-- No destructive updates.
-- No overwrites.
-- Every change is timestamped.
-
-This enables audits, deterministic replays, and forensic debugging.
+Prevents double-settlement in payment workflows.
 
 ---
 
-## 💥 Failure Handling
+### 5. Append-Only Audit
 
-Failure is assumed, not exceptional.
+State records are immutable:
+- No `UPDATE` statements on historical data
+- Every change is timestamped
+- Full replay capability for forensics
 
-| Scenario               | Behavior                              | Outcome          |
-| ---------------------- | ------------------------------------- | ---------------- |
-| **API Retry**          | Idempotency prevents duplication      | Safe             |
-| **Service Crash**      | Transaction rolls back                | No partial state |
-| **Kafka Unavailable**  | Events remain in outbox               | No data loss     |
-| **Partial Execution**  | No committed state                    | Atomic guarantee |
-| **Duplicate Messages** | Safely ignored (Idempotent consumers) | Safe             |
-
-There are no undefined states.
+Enables compliance audits and deterministic debugging.
 
 ---
 
-## 📡 Kafka Publishing Guarantees
+## Failure Handling
 
-The outbox publisher is configured for safety:
+| Scenario | Behavior | Outcome |
+|----------|----------|---------|
+| API retry | Idempotency key prevents duplication | Safe |
+| Service crash | DB transaction rolls back | No partial state |
+| Kafka down | Events remain in outbox | Eventual publish |
+| Concurrent updates | Optimistic lock rejects one | No corruption |
+| Duplicate Kafka messages | Consumers use `event_id` to deduplicate | Safe |
 
-| Setting              | Value          | Why                                 |
-| -------------------- | -------------- | ----------------------------------- |
-| `acks`               | `all`          | Wait for all replicas               |
-| `enable_idempotence` | `true`         | Prevent duplicate messages on retry |
-| `key`                | `aggregate_id` | Guaranteed ordering per transaction |
-
-- Duplicate Kafka messages are acceptable.
-- Duplicate state changes are impossible.
-- Consumers deduplicate using `event_id`.
+**Zero undefined states.**
 
 ---
 
-## 🛡 Validation
-
-Correctness is verified via **adversarial testing**.
-A safety benchmark simulates high contention by firing **50 concurrent state transitions** against the same transaction.
-
-**Run the test:**
-
-```bash
-python scripts/benchmark_state_safety.py
-
+## Kafka Publishing Config
+```python
+{
+    "acks": "all",  # Wait for all replicas
+    "enable.idempotence": True,  # Prevent duplicates
+    "key": aggregate_id,  # Per-transaction ordering
+}
 ```
 
-**Observed Result:**
+**Trade-off:** Duplicate Kafka messages are acceptable. Duplicate state changes are impossible.
 
-```text
+---
+
+## Correctness Validation
+
+### Safety Benchmark (Adversarial Test)
+
+Simulates 50 concurrent requests trying to modify the same transaction:
+```bash
+python scripts/benchmark_state_safety.py
+```
+
+**Result:**
+```
 🚀 Starting Safety Benchmark: 50 concurrent requests...
 🎯 Target: Single Wallet (wallet_8f3a...)
 
 📊 Results:
-✅ Successful Transactions (201): 1
-🛡️ Blocked Conflicts (409):      49
-❌ Other Errors:                 0
+✅ Successful Transitions: 1
+🛡️ Blocked Conflicts (409): 49
+❌ Other Errors: 0
 
-✅ PASSED: Perfect safety. No double spends detected.
-
+✅ PASSED: Perfect safety. No double-spends detected.
 ```
 
-This proves correctness under concurrency and validates optimistic locking behavior.
+Proves optimistic locking works under contention.
 
 ---
 
-## 🧩 Why This Is a Separate Service
+## System Separation Rationale
 
-The Sentinel system is split intentionally.
+| Concern | Ingestion Engine | Transaction Engine |
+|---------|-----------------|-------------------|
+| Failure mode | Partial/bad data | State corruption |
+| Retry strategy | Automatic | Explicit (idempotent) |
+| Consistency | At-least-once | Exactly-once (state) |
+| Optimization | Throughput | Correctness |
+| Scaling constraint | I/O bound | Validation/lock bound |
 
-| Concern            | Ingestion Engine    | Transaction Engine      |
-| ------------------ | ------------------- | ----------------------- |
-| **Failure Mode**   | Bad / partial data  | Corrupted state         |
-| **Retry Strategy** | Automatic           | Explicit, idempotent    |
-| **Consistency**    | At-least-once       | Exactly-once (State)    |
-| **Optimization**   | Throughput          | Correctness             |
-| **Scaling**        | I/O-bound (Vectors) | Lock / Validation bound |
-
-This separation isolates failure and simplifies reasoning. It is **failure isolation**, not over-engineering.
+This split isolates failure domains and simplifies reasoning about edge cases.
 
 ---
 
-## ❌ Out of Scope (Intentional)
+## Intentionally Out of Scope
 
-- AI inference
-- Document parsing
-- Vector databases
-- Authentication / User Management
-- UI or Dashboards
-- Sagas / Distributed transactions
-- "Exactly-once delivery" claims (impossible)
-
-Those belong in other bounded contexts.
+- AI inference (wrong layer)
+- Vector databases (different bounded context)
+- Authentication (orthogonal concern)
+- UI/dashboards (API-first design)
+- Distributed sagas (not needed for single-DB transactions)
+- "Exactly-once delivery" (theoretically impossible)
 
 ---
 
-## 🚀 Running the System
-
+## Running Locally
 ```bash
-# 1. Start infrastructure (Postgres, Redpanda, Redis)
+# Start infrastructure (Postgres, Redpanda, Redis)
 docker compose up -d
 
-# 2. Apply database migrations
+# Run migrations
 alembic upgrade head
 
-# 3. Start API
+# Start API
 uvicorn src.main:app --reload
 
-# 4. Start Outbox Publisher (in new terminal)
+# Start outbox publisher (separate terminal)
 python src/cmd/outbox_publisher.py
-
 ```
 
 ---
 
-## 📝 Final Note
+## Key Files for Review
 
-This repository exists to demonstrate one principle:
+Start here to understand correctness guarantees:
 
-> **State correctness is a design problem, not a retry problem.**
+1. **FSM rules:** `src/domain/fsm.py`
+2. **Optimistic locking:** `src/adapters/repository.py`
+3. **Outbox flow:** `src/adapters/outbox.py`
+4. **Safety benchmark:** `scripts/benchmark_state_safety.py`
 
-If you are reviewing this code, start with:
+---
 
-1. The **FSM rules** (`src/domain/fsm.py`)
-2. The **Optimistic Locking logic** (`src/adapters/repository.py`)
-3. The **Outbox flow** (`src/adapters/outbox.py`)
+## Core Principle
 
-That is where correctness lives.
+> State correctness is a design problem, not a retry problem.
+
+This system makes invalid states unrepresentable.
+```
+
+---
+
+## ~~~ FINANCIAL-TRANSACTIONS-DASHBOARD ~~~
+
+### GitHub Description (one-liner):
+```
+Full-stack financial analytics platform demonstrating CSV ingestion, async aggregation, and transaction visualization
+```
+
+### Topics:
+```
+fastapi react postgresql sqlalchemy analytics dashboard csv-processing fintech data-pipeline docker typescript
