@@ -260,17 +260,3 @@ Start here to understand correctness guarantees:
 > State correctness is a design problem, not a retry problem.
 
 This system makes invalid states unrepresentable.
-```
-
----
-
-## ~~~ FINANCIAL-TRANSACTIONS-DASHBOARD ~~~
-
-### GitHub Description (one-liner):
-```
-Full-stack financial analytics platform demonstrating CSV ingestion, async aggregation, and transaction visualization
-```
-
-### Topics:
-```
-fastapi react postgresql sqlalchemy analytics dashboard csv-processing fintech data-pipeline docker typescript
